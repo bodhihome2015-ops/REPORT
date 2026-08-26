@@ -14,11 +14,16 @@ import {
   ClipboardCheck,
   Clock3,
   Copy,
+  Download,
   FilePlus2,
   FileText,
+  HardDrive,
   House,
   ImagePlus,
+  KeyRound,
   LayoutDashboard,
+  LockKeyhole,
+  LogOut,
   MapPin,
   Menu,
   Plus,
@@ -28,6 +33,7 @@ import {
   Trash2,
   Upload,
   UserRound,
+  Users,
   Wrench,
   X,
 } from 'lucide-react';
@@ -36,6 +42,22 @@ import {
   REPORT_TEMPLATES,
   STATUS_OPTIONS,
 } from './inspection-data.js';
+import {
+  ROLE_META,
+  addCompanyUser,
+  authenticateUser,
+  changeOwnPassword,
+  clearSession,
+  createSession,
+  initializeCompany,
+  loadCompany,
+  loadSessionUser,
+  recordCompanyEvent,
+  resetCompanyUserPassword,
+  saveCompany,
+  setCompanyUserActive,
+  setCompanyUserRole,
+} from './company-auth.js';
 import './inspection-report.css';
 
 const STORAGE_KEY = 'bodhi-quality-reports-v1';
@@ -85,7 +107,7 @@ const getReportState = report => {
   return { key: 'pending', label: `进行中 ${stats.progress}%` };
 };
 
-const createReport = (templateKey, customType = 'nonstandard') => {
+const createReport = (templateKey, customType = 'nonstandard', currentUser = null) => {
   const template = REPORT_TEMPLATES[templateKey];
   return {
     id: '',
@@ -95,38 +117,29 @@ const createReport = (templateKey, customType = 'nonstandard') => {
     projectName: '',
     address: '',
     client: '',
-    inspector: '',
+    inspector: currentUser?.name || '',
     contractor: '',
     inspectionDate: today(),
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
     overallNote: '',
+    createdBy: currentUser?.id || '',
+    createdByName: currentUser?.name || '',
+    department: currentUser?.department || '',
+    approvalStatus: 'draft',
+    approvedBy: '',
+    approvedAt: '',
+    auditTrail: currentUser ? [{ id: `audit-${Date.now()}`, at: new Date().toISOString(), actorId: currentUser.id, actorName: currentUser.name, action: '创建报告' }] : [],
     nodes: clone(template.buildNodes(customType)),
   };
 };
 
-const createSeedReport = () => {
-  const report = createReport('steel');
-  report.id = 'BQ-20260820-7K2QF';
-  report.projectName = '顺义 · 林栖庭院住宅';
-  report.address = '北京市顺义区示范项目';
-  report.client = '张先生';
-  report.inspector = '王工';
-  report.contractor = '博笛智家项目组';
-  report.inspectionDate = '2026-08-19';
-  report.updatedAt = '2026-08-19T16:28:00';
-  const items = getItems(report);
-  items.slice(0, 11).forEach(item => { item.status = 'pass'; });
-  items[5].status = 'rectify';
-  items[5].note = '柱根局部蜂窝超出观感要求，已通知基础班组 8 月 21 日前修补并复验。';
-  items[1].measured = '三级配电箱，漏保测试正常';
-  items[4].measured = '主筋间距 150mm';
-  report.overallNote = '基础及主体抽检完成，钢构节点有 1 项待整改，其余抽检项符合验收标准。';
-  return report;
-};
-
 const migrateReportCopy = report => ({
   ...report,
+  approvalStatus: report.approvalStatus || 'draft',
+  approvedBy: report.approvedBy || '',
+  approvedAt: report.approvedAt || '',
+  auditTrail: Array.isArray(report.auditTrail) ? report.auditTrail : [],
   nodes: (report.nodes || []).map(node => ({
     ...node,
     phase: node.phase === '自定义' ? '专项验收' : node.phase,
@@ -141,11 +154,11 @@ const migrateReportCopy = report => ({
 const loadReports = () => {
   try {
     const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
-    if (Array.isArray(stored) && stored.length) return stored.map(report => report.id === 'BQ-20260820-7K2QF' ? createSeedReport() : migrateReportCopy(report));
+    if (Array.isArray(stored) && stored.length) return stored.map(migrateReportCopy);
   } catch {
     // Start with the built-in case if local data is unreadable.
   }
-  return [createSeedReport()];
+  return [];
 };
 
 const compressImage = file => new Promise((resolve, reject) => {
@@ -201,7 +214,76 @@ function ProgressRing({ value }) {
   );
 }
 
-function Sidebar({ onHome, compact, onToggle }) {
+function ApprovalBadge({ status }) {
+  const meta = {
+    draft: { label: '编制中', className: 'approval-draft' },
+    pending_review: { label: '待审核', className: 'approval-review' },
+    approved: { label: '已批准', className: 'approval-approved' },
+  }[status] || { label: '编制中', className: 'approval-draft' };
+  return <span className={`approval-badge ${meta.className}`}><ShieldCheck size={14} />{meta.label}</span>;
+}
+
+function AccessScreen({ company, onInitialize, onLogin }) {
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+  const [remember, setRemember] = useState(true);
+
+  const submit = async (event, action) => {
+    event.preventDefault();
+    setBusy(true);
+    setError('');
+    const values = Object.fromEntries(new FormData(event.currentTarget));
+    try {
+      if (!company && values.password !== values.confirmPassword) throw new Error('两次输入的密码不一致');
+      await action(values, remember);
+    } catch (submitError) {
+      setError(submitError.message || '操作失败，请稍后重试');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <main className="access-page">
+      <section className="access-brand-panel" aria-label="系统介绍">
+        <div className="access-brand"><BrandMark /><div><strong>博笛质检</strong><span>BODHI QUALITY</span></div></div>
+        <div>
+          <span className="access-kicker"><ShieldCheck size={16} />工程质量管理系统</span>
+          <h1>{company ? '登录质量管理平台' : '建立公司管理员账号'}</h1>
+          <p>{company ? `${company.organization.name} · 报告、整改与竣工审核` : '首次使用需要建立管理员。后续可由管理员添加质检、项目和查阅人员。'}</p>
+        </div>
+        <ul>
+          <li><CheckCircle2 size={17} />人员分级权限</li>
+          <li><CheckCircle2 size={17} />验收与整改闭环</li>
+          <li><CheckCircle2 size={17} />竣工审核与操作记录</li>
+        </ul>
+      </section>
+      <section className="access-form-panel">
+        <div className="access-form-card">
+          <div className="access-form-heading">
+            <LockKeyhole size={22} />
+            <div><h2>{company ? '人员登录' : '系统初始化'}</h2><p>{company ? '使用公司员工号和密码登录' : '此账号负责人员和数据管理'}</p></div>
+          </div>
+          <form onSubmit={event => submit(event, company ? onLogin : onInitialize)}>
+            {!company && <label><span>公司名称 *</span><input name="organizationName" autoComplete="organization" required placeholder="例：博笛智家" /></label>}
+            {!company && <label><span>管理员姓名 *</span><input name="name" autoComplete="name" required placeholder="真实姓名" /></label>}
+            <label><span>员工号 *</span><input name="employeeId" autoCapitalize="characters" autoComplete="username" required placeholder="例：BQ001" /></label>
+            {!company && <label><span>所属部门</span><input name="department" autoComplete="organization-title" placeholder="例：工程质量管理" /></label>}
+            <label><span>登录密码 *</span><input name="password" type="password" autoComplete={company ? 'current-password' : 'new-password'} required placeholder={company ? '输入登录密码' : '至少 8 位，包含字母和数字'} /></label>
+            {!company && <label><span>确认密码 *</span><input name="confirmPassword" type="password" autoComplete="new-password" required placeholder="再次输入密码" /></label>}
+            {company && <label className="remember-control"><input type="checkbox" checked={remember} onChange={event => setRemember(event.target.checked)} /><span>在此设备保持登录 12 小时</span></label>}
+            {error && <div className="form-error" role="alert"><AlertTriangle size={16} />{error}</div>}
+            <button className="primary-button access-submit" disabled={busy}>{busy ? '正在处理…' : company ? '登录系统' : '建立管理员并进入系统'}<ChevronRight size={17} /></button>
+          </form>
+          <p className="access-storage-note"><HardDrive size={15} />当前为本机数据模式，人员和报告保存在此浏览器。</p>
+        </div>
+      </section>
+    </main>
+  );
+}
+
+function Sidebar({ onHome, compact, onToggle, currentUser, activeArea = 'reports', onSettings, onStandards, onLogout }) {
+  const role = ROLE_META[currentUser?.role] || ROLE_META.viewer;
   return (
     <aside className={`app-sidebar ${compact ? 'is-compact' : ''}`}>
       <div className="brand-lockup">
@@ -210,24 +292,29 @@ function Sidebar({ onHome, compact, onToggle }) {
         <button className="mobile-menu-button" onClick={onToggle} aria-label="收起导航"><X size={20} /></button>
       </div>
       <nav aria-label="主导航">
-        <button className="nav-item is-active" onClick={onHome}><LayoutDashboard size={19} />工作台</button>
+        <button className={`nav-item ${activeArea === 'reports' ? 'is-active' : ''}`} onClick={onHome}><LayoutDashboard size={19} />工作台</button>
         <button className="nav-item" onClick={onHome}><FileText size={19} />质检报告</button>
-        <button className="nav-item" onClick={onHome}><BookOpenCheck size={19} />验收标准</button>
+        <button className={`nav-item ${activeArea === 'standards' ? 'is-active' : ''}`} onClick={onStandards}><BookOpenCheck size={19} />验收标准</button>
+        <button className={`nav-item ${activeArea === 'settings' ? 'is-active' : ''}`} onClick={onSettings}><Users size={19} />人员与设置</button>
       </nav>
       <div className="sidebar-source">
-        <ShieldCheck size={19} />
-        <div><strong>验收依据</strong><span>钢构 · 砖混 · 内装<br />工程质量验收标准</span></div>
+        <HardDrive size={19} />
+        <div><strong>本机数据模式</strong><span>数据保存在当前设备<br />请定期导出备份</span></div>
       </div>
-      <div className="sidebar-user"><span>王</span><div><strong>质检工程师</strong><small>工程质量管理</small></div></div>
+      <div className="sidebar-user">
+        <span>{currentUser?.name?.slice(0, 1) || '员'}</span>
+        <div><strong>{currentUser?.name || '当前人员'}</strong><small>{role.label} · {currentUser?.department || '未设置部门'}</small></div>
+        <button onClick={onLogout} aria-label="退出登录" title="退出登录"><LogOut size={16} /></button>
+      </div>
     </aside>
   );
 }
 
-function AppFrame({ children, onHome }) {
+function AppFrame({ children, onHome, currentUser, activeArea, onSettings, onStandards, onLogout }) {
   const [menuOpen, setMenuOpen] = useState(false);
   return (
     <div className="app-frame">
-      <Sidebar onHome={onHome} compact={!menuOpen} onToggle={() => setMenuOpen(false)} />
+      <Sidebar onHome={onHome} compact={!menuOpen} onToggle={() => setMenuOpen(false)} currentUser={currentUser} activeArea={activeArea} onSettings={onSettings} onStandards={onStandards} onLogout={onLogout} />
       {menuOpen && <button className="sidebar-scrim" aria-label="关闭导航" onClick={() => setMenuOpen(false)} />}
       <main className="app-main">
         <header className="mobile-header">
@@ -241,17 +328,17 @@ function AppFrame({ children, onHome }) {
   );
 }
 
-function Dashboard({ reports, onCreate, onOpen }) {
+function Dashboard({ reports, onCreate, onOpen, canEdit, shellProps }) {
   const [query, setQuery] = useState('');
   const reportStats = useMemo(() => {
     const openIssues = reports.reduce((sum, report) => sum + getStats(report).rectify, 0);
-    const complete = reports.filter(report => getStats(report).progress === 100).length;
+    const complete = reports.filter(report => report.approvalStatus === 'approved').length;
     return { total: reports.length, openIssues, complete };
   }, [reports]);
   const filtered = reports.filter(report => `${report.projectName}${report.id}${report.title}`.toLowerCase().includes(query.toLowerCase()));
 
   return (
-    <AppFrame onHome={() => {}}>
+    <AppFrame onHome={() => {}} {...shellProps}>
       <div className="page-shell dashboard-page">
         <header className="page-header dashboard-header">
           <div>
@@ -259,15 +346,17 @@ function Dashboard({ reports, onCreate, onOpen }) {
             <h1>质量报告中心</h1>
             <p>工程验收、问题整改与报告管理。</p>
           </div>
-          <button className="primary-button" onClick={() => onCreate('steel')}><Plus size={18} />新建报告</button>
+          {canEdit && <button className="primary-button" onClick={() => onCreate('steel')}><Plus size={18} />新建报告</button>}
         </header>
+
+        <div className="data-mode-banner" role="status"><HardDrive size={17} /><div><strong>当前数据保存在本机</strong><span>同一账号在其他设备上不会自动看到报告；请由管理员定期导出业务数据。</span></div></div>
 
         <section className="dashboard-overview" aria-label="报告概览">
           <div className="overview-copy">
             <span className="overview-kicker"><ShieldCheck size={16} />工程质量验收</span>
             <h2>项目质量验收与整改管理</h2>
             <p>覆盖开工准备、基础、主体、围护、水电防水、内装及竣工交付。</p>
-            <button className="light-button" onClick={() => onCreate('custom')}><FilePlus2 size={18} />新建专项报告</button>
+            {canEdit && <button className="light-button" onClick={() => onCreate('custom')}><FilePlus2 size={18} />新建专项报告</button>}
           </div>
           <div className="overview-metrics">
             <div><span>报告总数</span><strong>{reportStats.total}</strong><small>全部项目</small></div>
@@ -290,7 +379,7 @@ function Dashboard({ reports, onCreate, onOpen }) {
                   <h3>{template.title}</h3>
                   <p>{template.description}</p>
                   <div className="template-source"><BookOpenCheck size={15} />{template.handbook}</div>
-                  <button onClick={() => onCreate(template.key)}>创建报告<ChevronRight size={17} /></button>
+                  <button onClick={() => onCreate(template.key)} disabled={!canEdit}>{canEdit ? '创建报告' : '仅限查看'}<ChevronRight size={17} /></button>
                 </article>
               );
             })}
@@ -299,7 +388,7 @@ function Dashboard({ reports, onCreate, onOpen }) {
 
         <section className="section-block reports-section">
           <div className="section-heading report-heading">
-            <div><span className="section-index">02</span><div><h2>最近报告</h2><p>继续录入、查看详情或复制报告链接。</p></div></div>
+            <div><span className="section-index">02</span><div><h2>最近报告</h2><p>继续录入、查看详情或打印验收报告。</p></div></div>
             <label className="search-field"><Search size={17} /><span className="sr-only">搜索报告</span><input value={query} onChange={event => setQuery(event.target.value)} placeholder="搜索项目或报告编号" /></label>
           </div>
           <div className="report-table" role="table" aria-label="最近报告">
@@ -313,12 +402,12 @@ function Dashboard({ reports, onCreate, onOpen }) {
                   <span>{REPORT_TEMPLATES[report.template]?.shortTitle || report.title}</span>
                   <span>{formatDateTime(report.updatedAt)}</span>
                   <span className="table-progress"><i><b style={{ width: `${stats.progress}%` }} /></i><em>{stats.progress}%</em></span>
-                  <span><StatusBadge status={state.key} label={state.label} /></span>
+                  <span className="report-status-cell"><StatusBadge status={state.key} label={state.label} /><ApprovalBadge status={report.approvalStatus} /></span>
                   <span className="row-arrow"><ChevronRight size={18} /></span>
                 </button>
               );
             })}
-            {!filtered.length && <div className="empty-state"><FileText size={28} /><strong>没有找到报告</strong><span>调整搜索条件，或新建一份验收报告。</span></div>}
+            {!filtered.length && <div className="empty-state"><FileText size={28} /><strong>没有找到报告</strong><span>{canEdit ? '调整搜索条件，或新建一份验收报告。' : '当前没有可查看的验收报告。'}</span></div>}
           </div>
         </section>
       </div>
@@ -338,7 +427,7 @@ function ProjectFields({ draft, onChange }) {
   };
   return (
     <div className="project-fields">
-      {field('projectName', '项目名称 *', '例：顺义林栖庭院住宅', Building2)}
+      {field('projectName', '项目名称 *', '例：住宅项目一期', Building2)}
       {field('address', '项目地址', '省 / 市 / 区 / 详细地址', MapPin)}
       {field('client', '业主 / 委托方', '姓名或单位', UserRound)}
       {field('inspector', '质检负责人', '验收人员', ClipboardCheck)}
@@ -411,7 +500,7 @@ function InspectionItem({ item, nodeId, editable, onUpdate, onPhotos, onRemovePh
   );
 }
 
-function ReportEditor({ initialReport, initialNodeId, onBack, onGenerate, onGenerateNode, showToast }) {
+function ReportEditor({ initialReport, initialNodeId, onBack, onSaveDraft, onGenerate, onGenerateNode, showToast, shellProps }) {
   const [draft, setDraft] = useState(() => clone(initialReport));
   const [activeNodeId, setActiveNodeId] = useState(() => initialReport.nodes.some(node => node.id === initialNodeId) ? initialNodeId : initialReport.nodes[0]?.id);
   const [uploading, setUploading] = useState(false);
@@ -469,7 +558,30 @@ function ReportEditor({ initialReport, initialNodeId, onBack, onGenerate, onGene
       showToast(node ? '当前节点至少需要一个检查项' : '报告至少需要一个检查项', 'error');
       return false;
     }
+    if (!node && !draft.inspector.trim()) {
+      showToast('请填写质检负责人', 'error');
+      return false;
+    }
+    if (!node) {
+      const finalStats = getStats(draft);
+      if (finalStats.progress < 100) {
+        showToast(`还有 ${finalStats.total - finalStats.inspected} 项未检查，不能提交竣工审核`, 'error');
+        return false;
+      }
+      if (finalStats.rectify > 0) {
+        showToast(`还有 ${finalStats.rectify} 项待整改，复验合格后才能提交竣工审核`, 'error');
+        return false;
+      }
+    }
     return true;
+  };
+  const saveDraft = () => {
+    if (!draft.projectName.trim()) {
+      showToast('请先填写项目名称', 'error');
+      return;
+    }
+    const saved = onSaveDraft({ ...draft, updatedAt: new Date().toISOString() });
+    setDraft(saved);
   };
   const generate = () => {
     if (!validateReport()) return;
@@ -481,12 +593,12 @@ function ReportEditor({ initialReport, initialNodeId, onBack, onGenerate, onGene
   };
 
   return (
-    <AppFrame onHome={onBack}>
+    <AppFrame onHome={onBack} {...shellProps}>
       <div className="editor-page">
         <header className="editor-topbar">
           <button className="back-button" onClick={onBack}><ArrowLeft size={18} />返回工作台</button>
           <div className="editor-title"><span>{REPORT_TEMPLATES[draft.template].shortTitle}</span><strong>{draft.projectName || '新建质检报告'}</strong></div>
-          <div className="editor-actions"><span className="save-state"><Check size={14} />现场验收记录</span><button className="primary-button" onClick={generate} disabled={uploading}><FileText size={17} />生成竣工验收报告</button></div>
+          <div className="editor-actions"><ApprovalBadge status={draft.approvalStatus} /><button className="secondary-button" onClick={saveDraft} disabled={uploading}><Check size={16} />保存草稿</button><button className="primary-button" onClick={generate} disabled={uploading}><FileText size={17} />提交竣工审核</button></div>
         </header>
         <div className="editor-content">
           <section className="editor-project-card">
@@ -554,13 +666,13 @@ function ReportEditor({ initialReport, initialNodeId, onBack, onGenerate, onGene
                   <span>节点 {draft.nodes.findIndex(node => node.id === activeNode.id) + 1} / {draft.nodes.length}</span>
                   {draft.nodes.findIndex(node => node.id === activeNode.id) < draft.nodes.length - 1 ? (
                     <button onClick={() => setActiveNodeId(draft.nodes[draft.nodes.findIndex(node => node.id === activeNode.id) + 1].id)}>下一节点<ChevronRight size={17} /></button>
-                  ) : <button onClick={generate}>生成竣工验收报告<FileText size={17} /></button>}
+                  ) : <button onClick={generate}>提交竣工审核<FileText size={17} /></button>}
                 </div>
               </div>
             )}
           </section>
         </div>
-        <div className="mobile-generate-bar"><div><strong>{stats.progress}%</strong><span>{stats.inspected}/{stats.total} 已检查</span></div><button onClick={generate}><FileText size={17} />生成竣工报告</button></div>
+        <div className="mobile-generate-bar"><div><strong>{stats.progress}%</strong><span>{stats.inspected}/{stats.total} 已检查</span></div><button onClick={generate}><FileText size={17} />提交竣工审核</button></div>
       </div>
     </AppFrame>
   );
@@ -577,10 +689,10 @@ function ReportItemView({ item, index }) {
   );
 }
 
-function ReportView({ report, nodeId, onBack, onOpenFinal, onOpenNode, onEdit, onCopy, showToast }) {
+function ReportView({ report, nodeId, onBack, onOpenFinal, onOpenNode, onEdit, onCopy, onApprove, canEdit, canApprove, showToast, shellProps }) {
   if (!report) {
     return (
-      <AppFrame onHome={onBack}>
+      <AppFrame onHome={onBack} {...shellProps}>
         <div className="missing-report"><FileText size={36} /><h1>未找到报告</h1><p>报告链接无效或报告已不存在，请返回报告列表重新选择。</p><button className="primary-button" onClick={onBack}>返回工作台</button></div>
       </AppFrame>
     );
@@ -594,23 +706,23 @@ function ReportView({ report, nodeId, onBack, onOpenFinal, onOpenNode, onEdit, o
   const copyLink = async () => {
     try {
       await onCopy(report.id, selectedNode?.id);
-      showToast(isNodeReport ? '节点报告链接已复制' : '竣工验收报告链接已复制');
+      showToast(isNodeReport ? '节点报告本机链接已复制' : '竣工报告本机链接已复制');
     } catch {
       showToast('复制失败，请从地址栏复制链接', 'error');
     }
   };
   return (
-    <AppFrame onHome={onBack}>
+    <AppFrame onHome={onBack} {...shellProps}>
       <div className="report-view-page">
         <header className="report-toolbar no-print">
           <button className="back-button" onClick={isNodeReport ? () => onOpenFinal(report.id) : onBack}><ArrowLeft size={18} />{isNodeReport ? '返回竣工报告' : '返回工作台'}</button>
-          <div><button className="secondary-button" onClick={() => onEdit(report, selectedNode?.id)}><ClipboardCheck size={17} />继续编辑</button><button className="secondary-button" onClick={() => window.print()}><Printer size={17} />打印 / PDF</button><button className="primary-button" onClick={copyLink}><Copy size={17} />{isNodeReport ? '复制节点报告链接' : '复制竣工报告链接'}</button></div>
+          <div>{canEdit && <button className="secondary-button" onClick={() => onEdit(report, selectedNode?.id)}><ClipboardCheck size={17} />继续编辑</button>}<button className="secondary-button" onClick={() => window.print()}><Printer size={17} />打印 / PDF</button>{!isNodeReport && canApprove && report.approvalStatus === 'pending_review' && <button className="primary-button" onClick={() => onApprove(report.id)}><ShieldCheck size={17} />批准竣工报告</button>}<button className={!isNodeReport && canApprove && report.approvalStatus === 'pending_review' ? 'secondary-button' : 'primary-button'} onClick={copyLink}><Copy size={17} />复制本机链接</button></div>
         </header>
         <div className="report-document">
           <section className="report-cover">
             <div className="report-cover-top"><div className="report-brand"><BrandMark /><div><strong>博笛智家</strong><span>工程质量验收报告</span></div></div><span className="report-number">REPORT · {report.id}{isNodeReport ? `-${pad(nodeIndex + 1)}` : ''}</span></div>
             <div className="report-hero">
-              <div className="report-hero-copy"><span className="report-type">{isNodeReport ? `节点验收报告 · ${selectedNode.phase}` : `竣工验收报告 · ${REPORT_TEMPLATES[report.template]?.shortTitle || report.title}`}</span><h1>{isNodeReport ? selectedNode.title : report.projectName}</h1><p>{isNodeReport ? `${report.projectName} · ${report.address || '项目地址未填写'}` : report.address || '项目地址未填写'}</p><StatusBadge status={state.key} label={state.label} /></div>
+              <div className="report-hero-copy"><span className="report-type">{isNodeReport ? `节点验收报告 · ${selectedNode.phase}` : `竣工验收报告 · ${REPORT_TEMPLATES[report.template]?.shortTitle || report.title}`}</span><h1>{isNodeReport ? selectedNode.title : report.projectName}</h1><p>{isNodeReport ? `${report.projectName} · ${report.address || '项目地址未填写'}` : report.address || '项目地址未填写'}</p><div className="report-status-line"><StatusBadge status={state.key} label={state.label} />{!isNodeReport && <ApprovalBadge status={report.approvalStatus} />}</div></div>
               <ProgressRing value={stats.progress} />
             </div>
             <div className="report-info-grid">
@@ -627,6 +739,7 @@ function ReportView({ report, nodeId, onBack, onOpenFinal, onOpenNode, onEdit, o
               <div><strong>{stats.photos}</strong><span>现场照片</span></div>
             </div>
             {!isNodeReport && report.overallNote && <div className="overall-note"><strong>竣工验收综述</strong><p>{report.overallNote}</p></div>}
+            {!isNodeReport && <div className="approval-record"><div><span>编制人员</span><strong>{report.createdByName || report.inspector || '—'}</strong><small>{report.department || '工程质量管理'}</small></div><div><span>审核状态</span><ApprovalBadge status={report.approvalStatus} /></div><div><span>批准人员</span><strong>{report.approvedBy || '—'}</strong><small>{report.approvedAt ? formatDateTime(report.approvedAt) : '尚未批准'}</small></div></div>}
           </section>
 
           {!isNodeReport && <section className="report-directory">
@@ -653,8 +766,160 @@ function ReportView({ report, nodeId, onBack, onOpenFinal, onOpenNode, onEdit, o
             })}
           </section>
 
+          {!isNodeReport && Boolean(report.auditTrail?.length) && <section className="report-audit-section">
+            <div className="report-section-title"><span>03</span><div><h2>报告记录</h2><p>记录报告创建、保存、提交和批准过程。</p></div></div>
+            <ol className="report-audit-list">{report.auditTrail.slice(0, 12).map(event => <li key={event.id}><span>{formatDateTime(event.at)}</span><strong>{event.action}</strong><small>{event.actorName || '系统'}</small></li>)}</ol>
+          </section>}
+
           <footer className="report-footer"><div className="report-brand"><BrandMark /><div><strong>博笛智家</strong><span>{isNodeReport ? '节点验收报告' : '竣工验收报告'}</span></div></div><div><span>{isNodeReport ? '节点报告编号' : '竣工报告编号'}</span><strong>{report.id}{isNodeReport ? `-${pad(nodeIndex + 1)}` : ''}</strong><small>生成时间 {formatDateTime(report.updatedAt)}</small></div></footer>
         </div>
+      </div>
+    </AppFrame>
+  );
+}
+
+function StandardsPage({ onHome, shellProps }) {
+  const templates = Object.values(REPORT_TEMPLATES).filter(template => template.key !== 'custom');
+  const [selectedKey, setSelectedKey] = useState(templates[0]?.key || 'steel');
+  const selected = REPORT_TEMPLATES[selectedKey] || templates[0];
+  const nodes = selected?.buildNodes() || [];
+  const itemCount = nodes.reduce((sum, node) => sum + node.items.length, 0);
+
+  return (
+    <AppFrame onHome={onHome} {...shellProps}>
+      <div className="page-shell standards-page">
+        <header className="page-header"><div><p className="eyebrow">INSPECTION STANDARDS</p><h1>验收标准库</h1><p>查看各工程类型的验收节点、判定标准和现场取证要求。</p></div></header>
+        <div className="standards-layout">
+          <nav className="standards-tabs" aria-label="验收标准分类">
+            {templates.map(template => <button className={selectedKey === template.key ? 'is-active' : ''} onClick={() => setSelectedKey(template.key)} key={template.key}><BookOpenCheck size={17} /><span><strong>{template.shortTitle}</strong><small>{template.handbook}</small></span><ChevronRight size={16} /></button>)}
+          </nav>
+          <section className="standards-content">
+            <header><div><span>{selected.handbook}</span><h2>{selected.title}</h2><p>{selected.description}</p></div><div><strong>{nodes.length}</strong><span>验收节点</span><strong>{itemCount}</strong><span>检查项目</span></div></header>
+            <div className="standard-node-list">{nodes.map((node, nodeIndex) => <section key={node.id}>
+              <div className="standard-node-title"><span>{pad(nodeIndex + 1)}</span><div><h3>{node.title}</h3><p>{node.phase} · {node.summary}</p></div></div>
+              <div className="standard-item-list">{node.items.map((item, itemIndex) => <article key={item.id}><span>{pad(itemIndex + 1)}</span><div><h4>{item.title}</h4><p>{item.standard}</p><small><Camera size={13} />{item.evidence}</small></div></article>)}</div>
+            </section>)}</div>
+          </section>
+        </div>
+      </div>
+    </AppFrame>
+  );
+}
+
+function SettingsPage({ company, currentUser, reports, onHome, onAddUser, onToggleUser, onChangeRole, onResetPassword, onChangePassword, onExport, onImport, showToast, shellProps }) {
+  const [busy, setBusy] = useState('');
+  const role = ROLE_META[currentUser.role] || ROLE_META.viewer;
+  const photoCount = reports.reduce((sum, report) => sum + getStats(report).photos, 0);
+  const storageBytes = new Blob([JSON.stringify(reports)]).size;
+  const storageLabel = storageBytes > 1024 * 1024 ? `${(storageBytes / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(storageBytes / 1024))} KB`;
+
+  const execute = async (key, action, successMessage) => {
+    setBusy(key);
+    try {
+      await action();
+      if (successMessage) showToast(successMessage);
+      return true;
+    } catch (error) {
+      showToast(error.message || '操作失败', 'error');
+      return false;
+    } finally {
+      setBusy('');
+    }
+  };
+
+  const submitUser = event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = Object.fromEntries(new FormData(form));
+    execute('add-user', () => onAddUser(data), '人员账号已创建').then(success => success && form.reset());
+  };
+
+  const submitReset = event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = Object.fromEntries(new FormData(form));
+    execute('reset-password', () => onResetPassword(data.userId, data.password), '临时密码已设置').then(success => success && form.reset());
+  };
+
+  const submitPassword = event => {
+    event.preventDefault();
+    const form = event.currentTarget;
+    const data = Object.fromEntries(new FormData(form));
+    if (data.newPassword !== data.confirmPassword) {
+      showToast('两次输入的新密码不一致', 'error');
+      return;
+    }
+    execute('change-password', () => onChangePassword(data.currentPassword, data.newPassword), '密码已修改，请妥善保管').then(success => success && form.reset());
+  };
+
+  return (
+    <AppFrame onHome={onHome} {...shellProps}>
+      <div className="page-shell settings-page">
+        <header className="page-header">
+          <div><p className="eyebrow">SYSTEM & ACCESS</p><h1>人员与系统设置</h1><p>{company.organization.name} · 账号权限、数据备份与操作记录</p></div>
+        </header>
+
+        <section className="settings-summary" aria-label="系统状态">
+          <div><Users size={20} /><span>启用人员</span><strong>{company.users.filter(user => user.active).length}</strong><small>共 {company.users.length} 个账号</small></div>
+          <div><FileText size={20} /><span>业务报告</span><strong>{reports.length}</strong><small>{photoCount} 张现场照片</small></div>
+          <div><HardDrive size={20} /><span>本机占用</span><strong>{storageLabel}</strong><small>浏览器本地存储</small></div>
+        </section>
+
+        <div className="cloud-readiness-note" role="status"><AlertTriangle size={19} /><div><strong>云端协作服务尚未配置</strong><p>当前账号、照片和报告仅在本机有效。跨设备登录、集中备份、短信验证及真正的外部报告链接，需要接入公司服务器、数据库和文件存储。</p></div></div>
+
+        {role.canManageUsers && <section className="settings-card">
+          <div className="settings-card-heading"><div><span>01</span><div><h2>人员与角色</h2><p>按岗位分配创建、审核和查阅权限。</p></div></div></div>
+          <div className="user-table" role="table" aria-label="人员账号">
+            <div className="user-row user-row-head" role="row"><span>人员</span><span>员工号</span><span>角色</span><span>状态</span></div>
+            {company.users.map(user => <div className="user-row" role="row" key={user.id}>
+              <span className="user-identity"><b>{user.name.slice(0, 1)}</b><span><strong>{user.name}</strong><small>{user.department || '未设置部门'}</small></span></span>
+              <span>{user.employeeId}</span>
+              <span><select value={user.role} onChange={event => execute(`role-${user.id}`, () => onChangeRole(user.id, event.target.value), '人员角色已更新')} disabled={busy === `role-${user.id}`} aria-label={`设置 ${user.name} 的角色`}>{Object.entries(ROLE_META).map(([key, item]) => <option value={key} key={key}>{item.label}</option>)}</select></span>
+              <span><button className={`status-toggle ${user.active ? 'is-enabled' : ''}`} onClick={() => execute(`active-${user.id}`, () => onToggleUser(user.id, !user.active), `账号已${user.active ? '停用' : '启用'}`)} disabled={busy === `active-${user.id}` || user.id === currentUser.id}>{user.active ? '已启用' : '已停用'}</button></span>
+            </div>)}
+          </div>
+          <div className="settings-form-grid">
+            <form className="settings-form" onSubmit={submitUser}>
+              <h3><UserRound size={17} />新增人员</h3>
+              <label><span>姓名 *</span><input name="name" required /></label>
+              <label><span>员工号 *</span><input name="employeeId" required placeholder="例：BQ002" /></label>
+              <label><span>部门 *</span><input name="department" required placeholder="例：项目管理" /></label>
+              <label><span>角色 *</span><select name="role" defaultValue="inspector">{Object.entries(ROLE_META).map(([key, item]) => <option value={key} key={key}>{item.label}</option>)}</select></label>
+              <label><span>初始密码 *</span><input name="password" type="password" autoComplete="new-password" required placeholder="至少 8 位，包含字母和数字" /></label>
+              <button className="primary-button" disabled={busy === 'add-user'}><Plus size={16} />创建账号</button>
+            </form>
+            <form className="settings-form" onSubmit={submitReset}>
+              <h3><KeyRound size={17} />重置人员密码</h3>
+              <label><span>选择人员 *</span><select name="userId" required defaultValue=""><option value="" disabled>选择需要重置的人员</option>{company.users.map(user => <option value={user.id} key={user.id}>{user.name} · {user.employeeId}</option>)}</select></label>
+              <label><span>临时密码 *</span><input name="password" type="password" autoComplete="new-password" required placeholder="至少 8 位，包含字母和数字" /></label>
+              <p>请通过公司内部渠道单独告知该人员临时密码。</p>
+              <button className="secondary-button" disabled={busy === 'reset-password'}><KeyRound size={16} />设置临时密码</button>
+            </form>
+          </div>
+        </section>}
+
+        <section className="settings-card">
+          <div className="settings-card-heading"><div><span>{role.canManageUsers ? '02' : '01'}</span><div><h2>我的账号</h2><p>当前登录：{currentUser.name} · {ROLE_META[currentUser.role]?.label}</p></div></div></div>
+          <form className="password-form" onSubmit={submitPassword}>
+            <label><span>当前密码 *</span><input name="currentPassword" type="password" autoComplete="current-password" required /></label>
+            <label><span>新密码 *</span><input name="newPassword" type="password" autoComplete="new-password" required placeholder="至少 8 位，包含字母和数字" /></label>
+            <label><span>确认新密码 *</span><input name="confirmPassword" type="password" autoComplete="new-password" required /></label>
+            <button className="secondary-button" disabled={busy === 'change-password'}><LockKeyhole size={16} />修改密码</button>
+          </form>
+        </section>
+
+        {role.canManageUsers && <section className="settings-card">
+          <div className="settings-card-heading"><div><span>03</span><div><h2>数据备份</h2><p>导出报告和照片；恢复前请确认文件来源。</p></div></div></div>
+          <div className="backup-actions">
+            <button className="secondary-button" onClick={onExport}><Download size={17} />导出业务数据</button>
+            <label className="secondary-button file-import"><Upload size={17} />导入业务数据<input type="file" accept="application/json,.json" onChange={onImport} /></label>
+          </div>
+        </section>}
+
+        {role.canManageUsers && <section className="settings-card">
+          <div className="settings-card-heading"><div><span>04</span><div><h2>系统操作记录</h2><p>最近的账号与系统管理操作。</p></div></div></div>
+          <ol className="system-event-list">{(company.events || []).slice(0, 30).map(event => <li key={event.id}><span>{formatDateTime(event.at)}</span><strong>{event.detail}</strong><small>{event.actorName || '系统'}</small></li>)}</ol>
+        </section>}
       </div>
     </AppFrame>
   );
@@ -671,6 +936,8 @@ function Toast({ toast, onClose }) {
 }
 
 export default function InspectionReportApp() {
+  const [company, setCompany] = useState(loadCompany);
+  const [currentUser, setCurrentUser] = useState(() => loadSessionUser(loadCompany()));
   const [reports, setReports] = useState(loadReports);
   const [screen, setScreen] = useState(() => new URLSearchParams(window.location.search).get('report') ? 'report' : 'dashboard');
   const [activeReportId, setActiveReportId] = useState(() => new URLSearchParams(window.location.search).get('report') || '');
@@ -679,6 +946,20 @@ export default function InspectionReportApp() {
   const [editingNodeId, setEditingNodeId] = useState('');
   const [toast, setToast] = useState(null);
   const lastStorageError = useRef(false);
+
+  useEffect(() => {
+    if (company) saveCompany(company);
+  }, [company]);
+
+  useEffect(() => {
+    if (!currentUser || !company) return;
+    const updatedUser = company.users.find(user => user.id === currentUser.id && user.active);
+    if (updatedUser) setCurrentUser(updatedUser);
+    else {
+      clearSession();
+      setCurrentUser(null);
+    }
+  }, [company]);
 
   useEffect(() => {
     try {
@@ -705,6 +986,32 @@ export default function InspectionReportApp() {
   }, []);
 
   const showToast = (message, type = 'success') => setToast({ message, type });
+  const initializeAccount = async values => {
+    const nextCompany = await initializeCompany(values);
+    const admin = nextCompany.users[0];
+    saveCompany(nextCompany);
+    createSession(admin, true);
+    setCompany(nextCompany);
+    setCurrentUser(admin);
+  };
+  const loginAccount = async (values, remember) => {
+    const user = await authenticateUser(company, values.employeeId, values.password);
+    const nextCompany = recordCompanyEvent(company, { type: 'login', actorId: user.id, actorName: user.name, detail: '登录质量管理系统' });
+    saveCompany(nextCompany);
+    createSession(user, remember);
+    setCompany(nextCompany);
+    setCurrentUser(user);
+  };
+  const logout = () => {
+    if (company && currentUser) {
+      const nextCompany = recordCompanyEvent(company, { type: 'logout', actorId: currentUser.id, actorName: currentUser.name, detail: '退出质量管理系统' });
+      saveCompany(nextCompany);
+      setCompany(nextCompany);
+    }
+    clearSession();
+    setCurrentUser(null);
+    setScreen('dashboard');
+  };
   const goHome = () => {
     window.history.pushState({}, '', window.location.pathname);
     setScreen('dashboard');
@@ -713,8 +1020,21 @@ export default function InspectionReportApp() {
     setEditingReport(null);
     setEditingNodeId('');
   };
+  const openSettings = () => {
+    window.history.pushState({}, '', window.location.pathname);
+    setScreen('settings');
+    setEditingReport(null);
+    setEditingNodeId('');
+  };
+  const openStandards = () => {
+    window.history.pushState({}, '', window.location.pathname);
+    setScreen('standards');
+    setEditingReport(null);
+    setEditingNodeId('');
+  };
   const startCreate = templateKey => {
-    setEditingReport(createReport(templateKey));
+    if (!(ROLE_META[currentUser?.role]?.canEdit)) return;
+    setEditingReport(createReport(templateKey, 'nonstandard', currentUser));
     setEditingNodeId('');
     setScreen('editor');
   };
@@ -725,27 +1045,68 @@ export default function InspectionReportApp() {
     setActiveNodeId(nodeId);
     setScreen('report');
   };
-  const saveReport = draft => {
-    const report = { ...draft, id: draft.id || reportId(), updatedAt: new Date().toISOString() };
+  const saveReport = (draft, action, approvalStatus, closeEditor = true) => {
+    const now = new Date().toISOString();
+    const report = {
+      ...draft,
+      id: draft.id || reportId(),
+      createdBy: draft.createdBy || currentUser.id,
+      createdByName: draft.createdByName || currentUser.name,
+      department: draft.department || currentUser.department,
+      approvalStatus,
+      approvedBy: approvalStatus === 'approved' ? draft.approvedBy : '',
+      approvedAt: approvalStatus === 'approved' ? draft.approvedAt : '',
+      updatedAt: now,
+      auditTrail: [{ id: `audit-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, at: now, actorId: currentUser.id, actorName: currentUser.name, action }, ...(draft.auditTrail || [])].slice(0, 100),
+    };
     setReports(current => [report, ...current.filter(item => item.id !== report.id)]);
-    setEditingReport(null);
-    setEditingNodeId('');
+    if (closeEditor) {
+      setEditingReport(null);
+      setEditingNodeId('');
+    } else setEditingReport(report);
+    return report;
+  };
+  const saveDraft = draft => {
+    const report = saveReport(draft, draft.id ? '保存报告草稿' : '首次保存报告草稿', 'draft', false);
+    showToast('报告草稿已保存在本机');
     return report;
   };
   const saveAndOpen = draft => {
-    const report = saveReport(draft);
+    const report = saveReport(draft, '提交竣工审核', 'pending_review');
     openReport(report.id);
-    showToast('竣工验收报告已生成，可复制链接或打印为 PDF');
+    showToast('竣工验收报告已提交审核');
   };
   const saveAndOpenNode = (draft, nodeId) => {
-    const report = saveReport(draft);
+    const report = saveReport(draft, '生成节点验收报告', 'draft');
     openReport(report.id, nodeId);
-    showToast('节点验收报告已生成，可打印或复制链接');
+    showToast('节点验收报告已生成，可打印或复制本机链接');
   };
   const editReport = (report, nodeId = '') => {
+    if (!(ROLE_META[currentUser?.role]?.canEdit)) return;
     setEditingReport(clone(report));
     setEditingNodeId(nodeId);
     setScreen('editor');
+    if (report.approvalStatus === 'approved') showToast('批准后的报告如有修改，需要重新提交审核');
+  };
+  const approveReport = id => {
+    if (!(ROLE_META[currentUser?.role]?.canApprove)) return;
+    const target = reports.find(report => report.id === id);
+    if (!target) return;
+    const stats = getStats(target);
+    if (stats.progress < 100 || stats.rectify > 0) {
+      showToast('报告仍有待检或待整改项目，不能批准', 'error');
+      return;
+    }
+    const now = new Date().toISOString();
+    setReports(current => current.map(report => report.id === id ? {
+      ...report,
+      approvalStatus: 'approved',
+      approvedBy: currentUser.name,
+      approvedAt: now,
+      updatedAt: now,
+      auditTrail: [{ id: `audit-${Date.now()}`, at: now, actorId: currentUser.id, actorName: currentUser.name, action: '批准竣工验收报告' }, ...(report.auditTrail || [])],
+    } : report));
+    showToast('竣工验收报告已批准');
   };
   const copyReportLink = async (id, nodeId = '') => {
     const url = new URL(window.location.href);
@@ -761,12 +1122,65 @@ export default function InspectionReportApp() {
     textarea.remove();
   };
 
+  const addUser = async data => setCompany(await addCompanyUser(company, data, currentUser));
+  const toggleUser = (userId, active) => setCompany(setCompanyUserActive(company, userId, active, currentUser));
+  const changeRole = (userId, role) => setCompany(setCompanyUserRole(company, userId, role, currentUser));
+  const resetPassword = async (userId, password) => setCompany(await resetCompanyUserPassword(company, userId, password, currentUser));
+  const changePassword = async (currentPassword, newPassword) => {
+    const nextCompany = await changeOwnPassword(company, currentUser.id, currentPassword, newPassword);
+    const updatedUser = nextCompany.users.find(user => user.id === currentUser.id);
+    setCompany(nextCompany);
+    createSession(updatedUser, false);
+    setCurrentUser(updatedUser);
+  };
+  const exportBusinessData = () => {
+    const payload = {
+      product: '博笛质检',
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      organization: company.organization.name,
+      reports,
+    };
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `博笛质检业务数据_${today()}.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    setCompany(recordCompanyEvent(company, { type: 'data_exported', actorId: currentUser.id, actorName: currentUser.name, detail: `导出业务数据（${reports.length} 份报告）` }));
+    showToast('业务数据已导出');
+  };
+  const importBusinessData = async event => {
+    const input = event.currentTarget;
+    const file = input.files?.[0];
+    if (!file) return;
+    try {
+      if (file.size > 80 * 1024 * 1024) throw new Error('备份文件超过 80MB，无法在浏览器中安全导入');
+      const payload = JSON.parse(await file.text());
+      if (payload?.product !== '博笛质检' || !Array.isArray(payload.reports)) throw new Error('不是有效的博笛质检业务数据文件');
+      const imported = payload.reports.map(migrateReportCopy).filter(report => report?.id && Array.isArray(report.nodes));
+      setReports(current => [...imported, ...current.filter(report => !imported.some(item => item.id === report.id))]);
+      setCompany(recordCompanyEvent(company, { type: 'data_imported', actorId: currentUser.id, actorName: currentUser.name, detail: `导入业务数据（${imported.length} 份报告）` }));
+      showToast(`已导入 ${imported.length} 份报告`);
+    } catch (error) {
+      showToast(error.message || '业务数据导入失败', 'error');
+    } finally {
+      input.value = '';
+    }
+  };
+
   const activeReport = reports.find(report => report.id === activeReportId);
+  if (!currentUser) return <AccessScreen company={company} onInitialize={initializeAccount} onLogin={loginAccount} />;
+  const permission = ROLE_META[currentUser.role] || ROLE_META.viewer;
+  const shellProps = { currentUser, onSettings: openSettings, onStandards: openStandards, onLogout: logout, activeArea: screen === 'settings' ? 'settings' : screen === 'standards' ? 'standards' : 'reports' };
   return (
     <>
-      {screen === 'dashboard' && <Dashboard reports={reports} onCreate={startCreate} onOpen={openReport} />}
-      {screen === 'editor' && editingReport && <ReportEditor initialReport={editingReport} initialNodeId={editingNodeId} onBack={goHome} onGenerate={saveAndOpen} onGenerateNode={saveAndOpenNode} showToast={showToast} />}
-      {screen === 'report' && <ReportView report={activeReport} nodeId={activeNodeId} onBack={goHome} onOpenFinal={openReport} onOpenNode={openReport} onEdit={editReport} onCopy={copyReportLink} showToast={showToast} />}
+      {screen === 'dashboard' && <Dashboard reports={reports} onCreate={startCreate} onOpen={openReport} canEdit={permission.canEdit} shellProps={shellProps} />}
+      {screen === 'editor' && editingReport && permission.canEdit && <ReportEditor initialReport={editingReport} initialNodeId={editingNodeId} onBack={goHome} onSaveDraft={saveDraft} onGenerate={saveAndOpen} onGenerateNode={saveAndOpenNode} showToast={showToast} shellProps={shellProps} />}
+      {screen === 'report' && <ReportView report={activeReport} nodeId={activeNodeId} onBack={goHome} onOpenFinal={openReport} onOpenNode={openReport} onEdit={editReport} onCopy={copyReportLink} onApprove={approveReport} canEdit={permission.canEdit} canApprove={permission.canApprove} showToast={showToast} shellProps={shellProps} />}
+      {screen === 'standards' && <StandardsPage onHome={goHome} shellProps={shellProps} />}
+      {screen === 'settings' && <SettingsPage company={company} currentUser={currentUser} reports={reports} onHome={goHome} onAddUser={addUser} onToggleUser={toggleUser} onChangeRole={changeRole} onResetPassword={resetPassword} onChangePassword={changePassword} onExport={exportBusinessData} onImport={importBusinessData} showToast={showToast} shellProps={shellProps} />}
       <Toast toast={toast} onClose={() => setToast(null)} />
     </>
   );
